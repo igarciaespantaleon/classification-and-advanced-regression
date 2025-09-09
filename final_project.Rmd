@@ -1,0 +1,1984 @@
+---
+title: "Advanced Modeling final project"
+subtitle: "Supervised Learning"
+author: "Irene García"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This project aims to explore two key areas of predictive modeling: classification and advanced regression.
+Using customer behavior data, we first build models to predict churn risk, a well-defined classification task. We then shift to a regression problem, attempting to predict average transaction value. This contrast allows us to evaluate different modeling approaches, paying attention to both interpretation and predictive performance.
+
+## Libraries
+
+The first step is to load the libraries that we will use throughout the exercise.
+
+```{r, message = FALSE, warning = FALSE}
+library(MASS)
+library(Metrics)
+library(dplyr)
+library(tibble)
+library(explore)
+library(DataExplorer)
+library(skimr)
+library(stringr)
+library(lubridate)
+library(hms)
+library(ggplot2)
+library(ggeffects)
+library(patchwork)
+library(tidyr)
+library(purrr)
+library(GGally)
+library(mice)
+library(e1071)
+library(caret)
+library(nnet)
+library(glmnet)
+library(pROC)
+library(naivebayes)
+library(klaR)
+library(rpart)
+library(rpart.plot)
+library(gbm)
+library(pdp)
+library(broom)
+```
+
+```{r, include = FALSE}
+rm(list = ls())
+```
+
+## Data load
+
+```{r}
+data <- read.csv("churn.csv")
+```
+
+This dataset focuses on customer churn and includes a series of demographic variables and historical consumer behavior data, providing insights into user characteristics and activity patterns that may influence retention.
+
+# EDA and cleaning
+
+```{r}
+glimpse(data)
+plot_intro(data)
+plot_missing(data)
+```
+
+Our data consists of 6 numeric columns (3 of them are integer and the
+other 3 are continuous) and 17 categorical ones. We can anticipate that
+missing values might not be explicitly stored as NA, because only one
+variable appears to have missing values.
+
+One of the first things I notice is that column names are already fairly
+clean. The following list contains a brief description of each variable
+in the dataset:
+
+-   customer_id: unique identification number of a customer
+
+-   age: age of a customer
+
+-   security_no: unique security number that is used to identify a
+    person
+
+-   region_category: region that a customer belongs to
+
+-   membership_category: category of the membership that a customer is
+    using
+
+-   joining_date: date when a customer became a member
+
+-   joined_through_referral: whether a customer joined using any
+    referral code or ID
+
+-   referral_id: referral ID that the customer used for joining
+
+-   preferred_offer_types: type of offer that a customer prefers
+
+-   medium_of_operation: medium of operation that a customer uses for
+    transactions
+
+-   internet_option: type of internet service a customer uses
+
+-   last_visit_time: last time a customer visited the website
+
+-   days_since_last_login: number of days since a customer last logged
+    into the website
+
+-   avg_time_spent: average time spent by a customer on the website
+    (likely in minutes)
+
+-   avg_transaction_value: average transaction value of a customer
+
+-   avg_frequency_login_days: number of times a customer has logged in
+    to the website
+
+-   points_in_wallet: points awarded to a customer on each transaction
+
+-   used_special_discount: whether a customer uses special discounts
+    offered
+
+-   offer_application_preference: whether a customer prefers offers
+
+-   past_complaint: whether a customer has raised any complaints
+
+-   complaint_status: whether the complaints raised by a customer were
+    resolved
+
+-   feedback: feedback provided by a customer
+
+-   churn_risk_score: 0 - no churn, 1 - churn
+
+### Handling missing data
+
+There are two variables that have "?" for NAs: joined_through_referral
+and medium_of_operation. Another variable, referral_id, presents some
+rows with "xxxxxxxx".
+
+```{r}
+# NAs as ? 
+data %>% summarise(across(everything(), ~ sum(. == "?", na.rm = TRUE)))
+
+# xxxxx where Not Applicable
+data %>%
+  summarise(across(
+    where(is.character),
+    ~ sum(str_detect(.x, "^x+$"))))
+```
+
+We can replace the first ones with NAs, whereas for referral_id, we can
+observe that those missing values correspond to the users for which
+join_through_referral is false, which makes perfect sense: if the user
+didn't join through a referral, they cannot be linked to a specific
+referral ID. We can replace those rows with "Not Applicable" for
+clarity, but keeping in mind that an ID column is not useful for our
+analysis and will be dropped later on.
+
+```{r}
+data <- data %>%
+  mutate(
+    joined_through_referral = na_if(joined_through_referral, "?"),
+    medium_of_operation = na_if(medium_of_operation, "?")
+  )
+
+data <- data %>%
+  mutate(
+    referral_id = ifelse(str_detect(referral_id, "^X+$"), "Not Applicable", referral_id)
+  )
+```
+
+I also noticed that most of the NAs in joined_through_referral have a
+referral_id linked to them, which according to our logic means that they
+did in fact join through a referral, so we can manually "impute" those
+NAs as "Yes".
+
+```{r}
+data <- data %>%
+  mutate(
+    joined_through_referral = case_when(
+      is.na(joined_through_referral) & referral_id != "Not Applicable" ~ "Yes",
+      TRUE ~ joined_through_referral
+    )
+  )
+```
+
+We can put this to test:
+
+```{r}
+data %>% 
+  filter(referral_id == "Not Applicable", joined_through_referral != "No") %>% count()
+
+data %>% 
+  filter(referral_id != "Not Applicable", joined_through_referral != "Yes") %>% count()
+```
+
+We can see that many of the rows for which joined_through_referral is
+true, still have a missing referral ID (although, as I said, we don't
+really care about this column). The important thing is that no user that
+didn't join through referral has a referral ID attached, which would
+likely be an error.
+
+Regarding the gender variable, there is an "unknown" category, which we
+can also convert to NA.
+
+```{r}
+table(data$gender)
+
+data <- data |> 
+  mutate(
+    gender = na_if(gender, "Unknown")
+  )
+```
+
+There are also variables stored in the wrong format, like
+avg_frequency_login_days, which should be numeric but is currently
+stored as character. The missing values in this column are stored as
+"Error", so we replace them with explicit NAs.
+
+```{r}
+summary(data$avg_frequency_login_days)
+data |> filter(avg_frequency_login_days == "Error") |> count()
+
+data <- data %>%
+  mutate(
+    avg_frequency_login_days = na_if(avg_frequency_login_days, "error"), # Replace "error" with NA
+    avg_frequency_login_days = as.numeric(avg_frequency_login_days)      # Convert to numeric
+  )
+
+sum(is.na(data$avg_frequency_login_days))
+```
+
+Moving forward, NAs in region_category and preferred_offer_types are
+stored as empty strings, so we will also convert them to NAs.
+
+```{r}
+data <- data %>%
+  mutate(region_category = na_if(region_category, ""),
+         preferred_offer_types = na_if(preferred_offer_types, ""))
+```
+
+We can keep inspecting missing values in our numerical variables:
+
+```{r}
+numeric_vars <- data %>%
+  select(where(is.numeric))
+
+summary(numeric_vars)
+```
+
+We shouldn't be seeing negative values for variables that reflect time.
+We may further inspect their distributions:
+
+```{r}
+numeric_vars |>
+  gather(key = "Variable", value = "Value") |>
+  ggplot(aes(x = Value)) +
+  geom_histogram(bins = 20) +
+  facet_wrap(~ Variable, scales = "free")
+```
+
+Age seems to be pretty homogeneously distributed across all users in the dataset. Users older than 60 become less likely.
+
+Avg_transaction_value shows an odd distribution, where the vast majority of values lie below 50,000, where we see a sharp division, and a long tail extending to 100,000. However, the two groups appear to be quite uniform.
+
+In the case of points_in_wallet, values are clustered tightly around 600-800, presenting little variation across the dataset.
+
+If we look at days_since_last_login, the value of -999 is likely a recoded NA, since it's the only negative value that the variable takes.
+
+```{r}
+data <- data |> 
+ mutate(
+    days_since_last_login = na_if(days_since_last_login, -999))
+
+hist(data$days_since_last_login)
+```
+
+After removing -999, the variable shows a close to normal distribution.
+
+For avg_time_spent and avg_frequency_login_days, the negative values are
+not very frequent according to their distributions. Since we have no
+other way to interpret them, we might just treat them as errors and
+replace them with NAs. We will maintain the negative values in
+points_in_wallet, because they might be informative.
+
+```{r}
+data <- data %>%
+  mutate(
+    avg_time_spent = if_else(avg_time_spent < 0, NA_real_, avg_time_spent),
+    avg_frequency_login_days = if_else(avg_frequency_login_days < 0, NA_real_, avg_frequency_login_days)
+  )
+
+hist(data$avg_time_spent)
+hist(data$avg_frequency_login_days)
+```
+
+Both of these variables present positive skewness, indicating that
+values higher than 30 are much less likely than values lower. This
+variables indicates the number of days that users have logged into the
+app, but we don't know in what time period.
+
+### Categorical variables
+
+```{r}
+# Drop identifiers
+data <- data |> 
+  select(-c(security_no, referral_id))
+
+# Variables to exclude (not categorical)
+exclude_vars <- c("joining_date", "last_visit_time")
+
+# Convert character cols (except exclude_vars) to factors
+data <- data %>%
+  mutate(across(.cols = where(is.character) & !all_of(exclude_vars), as.factor))
+
+
+data %>%
+  select(where(is.factor)) %>%
+  summarise(across(everything(), ~ paste(levels(.x), collapse = ", "))) %>%
+  pivot_longer(cols = everything(),
+               names_to = "variable",
+               values_to = "labels")
+```
+
+```{r}
+p1 <- ggplot(data, aes(x = gender)) +
+  geom_bar(fill = "tomato") +
+  labs(title = "Gender", x = "", y = "count") +
+  theme_minimal()
+p2 <- ggplot(data, aes(x = region_category)) +
+  geom_bar(fill = "tomato") +
+  labs(title = "Region", x = "", y = "count") +
+  theme_minimal()
+p3 <- ggplot(data, aes(x = membership_category)) +
+  geom_bar(fill = "tomato") +
+  labs(title = "Membership category", x = "", y = "count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p1 + p2 + p3
+```
+
+Gender is pretty balanced across the dataset. Regarding region, town is the most
+frequent category, followed by city, while village is much less common. Basic and
+No membership are the most common types of membership (probably the cheapest, if
+not free, options, with fewer user benefits), while platinum and premium (the most 
+expensive ones, likely with greater advantages) are the less frequent ones.
+
+```{r}
+p4 <- ggplot(data, aes(x = preferred_offer_types)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Preferred offer type", x = "", y = "count") +
+  theme_minimal() +
+  coord_flip()
+p5 <- ggplot(data, aes(x = medium_of_operation)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Medium of operation", x = "", y = "count") +
+  theme_minimal() +
+  coord_flip()
+p6 <- ggplot(data, aes(x = internet_option)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Internet option", x = "", y = "count") +
+  theme_minimal() +
+  coord_flip()
+
+p4 + p5 + p6
+```
+
+The preferred offer type is very balanced, as well as the internet option. Regarding
+medium of operation, users are more likely to use either their smartphones or their
+desktops, than both devices.
+
+```{r}
+p7 <- ggplot(data, aes(x = joined_through_referral)) +
+  geom_bar(fill = "navy") +
+  labs(title = "Joined through a referral?", x = "", y = "count") +
+  theme_minimal()
+p8 <- ggplot(data, aes(x = used_special_discount)) +
+  geom_bar(fill = "navy") +
+  labs(title = "Uses special discounts?", x = "", y = "count") +
+  theme_minimal()
+p9 <- ggplot(data, aes(x = offer_application_preference)) +
+  geom_bar(fill = "navy") +
+  labs(title = "Prefers offers?", x = "", y = "count") +
+  theme_minimal()
+p10 <- ggplot(data, aes(x = past_complaint)) +
+  geom_bar(fill = "navy") +
+  labs(title = "Past complaints?", x = "", y = "count") +
+  theme_minimal()
+
+p7 + p8 + p9 + p10
+```
+
+According to these plots, it's more common to join to referral, to use special discounts,
+and to prefer offers than not. Approximately half of the users in the dataset have
+filed complaints in the past.
+
+```{r}
+p11 <- ggplot(data, aes(x = complaint_status)) +
+  geom_bar(fill = "orange") +
+  labs(title = "Complaint status", x = "", y = "count") +
+  theme_minimal() +
+  coord_flip()
+p12 <- ggplot(data, aes(x = feedback)) +
+  geom_bar(fill = "orange") +
+  labs(title = "Feedback category", x = "", y = "count") +
+  theme_minimal() +
+  coord_flip()
+
+p11 + p12
+```
+
+Regarding complaint status, the 4 options for actual complaints are fairly balanced,
+while Not Applicable likely refers to rows with no past complaints. Lastly, we observe
+that negative feedback comments are much more common than positive ones.
+
+### Date and time variables
+
+There are some date and time columns that we could convert, in order to get more useful variables for our analysis.
+
+```{r}
+data <- data %>%
+  mutate(
+    joining_date = dmy(joining_date),
+    last_visit_time = as_hms(last_visit_time))
+```
+
+First,we convert the user's joining date, extracting the year, the month, the day of the week and the number of days since the user joined:
+
+```{r}
+data <- data %>%
+  mutate(
+    joining_year = year(joining_date), # Extract year
+    joining_month = month(joining_date), # Extract month number
+    joining_weekday = wday(joining_date, label = TRUE, locale = "EN-us"), # Extract day of week
+    days_since_joining = as.numeric(max(joining_date, na.rm = TRUE) - joining_date) # Days since joining
+  )
+```
+
+Secondly, we convert the time of the user's last visit to a factor variable indicating the period of the day:
+
+```{r}
+data <- data |> 
+  mutate(
+    last_visit_hour = hour(last_visit_time),                   
+    last_visit_period = factor(case_when(                               
+      last_visit_hour >= 5  & last_visit_hour < 12 ~ "Morning",
+      last_visit_hour >= 12 & last_visit_hour < 17 ~ "Afternoon",
+      last_visit_hour >= 17 & last_visit_hour < 21 ~ "Evening",
+      TRUE ~ "Night"
+    ), levels = c("Morning", "Afternoon", "Evening", "Night"))
+  )
+data <- data |> 
+  mutate(joining_weekday = factor(joining_weekday, ordered = FALSE)) 
+# convert to unordered
+```
+
+We can now check the distributions of these new variables:
+
+```{r}
+ggplot(data, aes(x = joining_weekday)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Distribution of Joining Weekday", x = "Weekday", y = "Count")
+
+ggplot(data, aes(x = joining_year)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Distribution of Joining Year", x = "Year", y = "Count")
+
+ggplot(data, aes(x = joining_month)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Distribution of Joining Month", x = "Month", y = "Count")
+
+ggplot(data, aes(x = days_since_joining)) +
+  geom_histogram(fill = "steelblue", bins = 20) +
+  labs(title = "Distribution of Days since Joining", x = "Days", y = "Count")
+
+ggplot(data, aes(x = last_visit_hour)) +
+  geom_bar(fill = "darkorange") +
+  labs(title = "Distribution of Last Visit Hour", x = "Hour of Day", y = "Count")
+
+ggplot(data, aes(x = last_visit_period)) +
+  geom_bar(fill = "darkorange") +
+  labs(title = "Distribution of Last Visit Period", x = "Period of Day", y = "Count")
+
+```
+
+Most of these new variables appear to be very uniform. Last visit period is the only
+one with a notable imbalance between categories, where night is the most frequent one.
+
+We can now get rid of the less informative original variables, to avoid multicollinearity issues.
+
+```{r}
+data <- data %>% 
+  select(-joining_date, -last_visit_time)
+```
+
+After having converted our variables to the appropriate types and recoded NAs explicitly,
+we can repeat these tests:
+
+```{r}
+plot_intro(data)
+plot_missing(data)
+```
+
+Nine of our variables have missing values: four of them have a
+proportion of NAs lower than 5%, and the remaining five have 5-15% of
+NAs. These levels of missingness are manageable, so it's worth imputing
+them instead of removing these rows altogether, since the total number
+of observations in our dataset is reasonably large.
+
+### Imputations
+
+```{r imputations, cache = TRUE}
+set.seed(123)
+
+m = 4 # number of multiple imputations
+
+imputations <- mice(data, m = m, method = 'rf')
+data_imp <- complete(imputations, action = m)
+```
+
+Finally, we check that imputations have worked:
+
+```{r}
+describe_tbl(data_imp)
+```
+
+Indeed, we now have 0 NAs in our dataset.
+
+## Targets
+
+For the supervised learning tasks, we first identified potential target
+variables for both classification and regression. For the classification
+task, we selected churn_risk_score as the categorical target, since it
+is the most natural choice for predicting customer retention. For the
+regression task, we considered several continuous variables that reflect
+customer behavior and value, such as points_in_wallet,
+days_since_last_login, avg_time_spent, and avg_transaction_value. After
+careful consideration, we chose avg_transaction_value as the regression
+target because it provides a meaningful measure of the customer's
+average spending, which is crucial for business decision-making and
+revenue forecasting. This choice allows us to model and predict customer
+purchasing behavior effectively.
+
+## Classification
+
+In this section, we will apply probabilistic and machine learning methods for classification.
+
+### Exploring the target: churn risk
+
+Before moving on to modeling, we can explore the relationship of our binary outcome with the rest of the
+predictors in the dataset. First, we will check correlations between the numerical variables (including
+the target, which is currently stored as numeric, taking values 0 and 1).
+
+```{r}
+# rewrite numeric variables
+numeric_vars <- data_imp %>% 
+  select(
+    age,
+    days_since_last_login,
+    avg_time_spent,
+    avg_transaction_value,
+    avg_frequency_login_days,
+    points_in_wallet,
+    joining_month,
+    joining_year,
+    days_since_joining,
+    last_visit_hour,
+    churn_risk_score
+  )
+
+ggcorr(numeric_vars, label = TRUE)
+```
+
+Most numeric variables have a zero correlation with others, and only three of
+them seem to be correlated with the target, at least linearly. This might affect
+model performance. On the other hand, our predictors are not redundant, so we
+won't have multicollinearity issues.
+
+Since joining_year and days_since_joining are almost perfectly correlated, we
+will drop one of them.
+
+```{r}
+data_imp <- data_imp %>% select(-joining_year)
+```
+
+Now, we can plot the relationship between our target and the correlated variables:
+
+```{r}
+# avg_transaction_value
+ggplot(data_imp, aes(x = factor(churn_risk_score), y = avg_transaction_value)) +
+  geom_boxplot(fill = "lightgreen") +
+  labs(x = "churn", y = "avg_transaction_value", 
+       title = "Transaction value by churn risk") +
+  theme_minimal()
+
+# avg_frequency_login_days
+ggplot(data_imp, aes(x = factor(churn_risk_score), y = avg_frequency_login_days)) +
+  geom_boxplot(fill = "lightgreen") +
+  labs(x = "churn", y = "avg_frequency_login_days", 
+       title = "Login frequency by churn risk") +
+  theme_minimal()
+
+# points_in_wallet
+ggplot(data_imp, aes(x = factor(churn_risk_score), y = points_in_wallet)) +
+  geom_boxplot(fill = "lightgreen") +
+  labs(x = "churn", y = "points_in_wallet", 
+       title = "Wallet points by churn risk") +
+  theme_minimal()
+```
+
+Average transaction value appears to be negatively associated with churn: high
+spenders are less likely to churn.
+The positive relationship between churn and average login days seems counterintuitive:
+non-churners login less frequently than churners, with a considerable number of
+outliers in both groups.
+Lastly, regarding wallet points, we see a negative relationship: users with more
+wallet points also seem less likely to churn. This variable contains a large number
+of outliers in both the lower and the higher ends.
+
+Next, we can print the average churn risk score grouped by the different factor variables, to check how churn
+is distributed across categories. It's worth noting that our categorical target variable seems fairly balanced 
+across the whole dataset, with 54% users with churn risk score of 1. 
+ 
+```{r}
+prop.table(table(data_imp$churn_risk_score))
+
+# Gender
+data_imp %>%
+    group_by(gender) %>%
+    summarise(mean_churn = mean(churn_risk_score), count = n())
+
+# Region
+data_imp %>%
+    group_by(region_category) %>%
+    summarise(mean_churn = mean(churn_risk_score), count = n())
+
+# Membership
+data_imp %>%
+    group_by(membership_category) %>%
+    summarise(mean_churn = mean(churn_risk_score), count = n())
+
+# Joined through referral
+data_imp %>%
+    group_by(joined_through_referral) %>%
+    summarise(mean_churn = mean(churn_risk_score), count = n())
+
+# Preferred offer types
+data_imp %>%
+    group_by(preferred_offer_types) %>%
+    summarise(mean_churn = mean(churn_risk_score), count = n())
+
+# Medium of operation
+data_imp %>%
+    group_by(medium_of_operation) %>%
+    summarise(mean_churn = mean(churn_risk_score), count = n())
+
+# Internet option
+data_imp %>%
+    group_by(internet_option) %>%
+    summarise(mean_churn = mean(churn_risk_score), count = n())
+
+# Special discount use
+data_imp %>%
+    group_by(used_special_discount) %>%
+    summarise(mean_churn = mean(churn_risk_score), count = n())
+
+# Offer application preference
+data_imp %>%
+    group_by(offer_application_preference) %>%
+    summarise(mean_churn = mean(churn_risk_score), count = n())
+
+# Past complaint
+data_imp %>%
+    group_by(past_complaint) %>%
+    summarise(mean_churn = mean(churn_risk_score), count = n())
+
+# Complaint status
+data_imp %>%
+    group_by(complaint_status) %>%
+    summarise(mean_churn = mean(churn_risk_score), count = n())
+
+# Feedback 
+data_imp %>%
+    group_by(feedback) %>%
+    summarise(mean_churn = mean(churn_risk_score), count = n())
+
+# Joining weekday
+data_imp %>%
+    group_by(joining_weekday) %>%
+    summarise(mean_churn = mean(churn_risk_score), count = n())
+
+# Last visit period
+data_imp %>%
+    group_by(last_visit_period) %>%
+    summarise(mean_churn = mean(churn_risk_score), count = n())
+```
+
+Churn risk seems to be pretty evenly distributed across most of our
+categorical variables, with the exception of membership category and feedback.
+
+```{r}
+# membership_category
+ggplot(data_imp, aes(x = membership_category, y = churn_risk_score)) +
+  stat_summary(fun = mean, geom = "bar", fill = "steelblue") +
+  labs(title = "churn rate by membership_category", x = "membership_category", y = "mean churn") +
+  theme_minimal() +
+  coord_flip()
+
+# feedback
+ggplot(data_imp, aes(x = feedback, y = churn_risk_score)) +
+  stat_summary(fun = mean, geom = "bar", fill = "steelblue") +
+  labs(title = "churn rate by feedback", x = "feedback", y = "mean churn") +
+  theme_minimal() +
+  coord_flip()
+```
+
+After these tests, we may convert our target variable to factor before modeling:
+
+```{r}
+data_imp <- data_imp |> 
+  mutate(
+    churn_risk_score = factor(churn_risk_score, 
+                              levels = c("0", "1"), 
+                              labels = c("No", "Yes"))
+  )
+```
+
+### Data split
+
+We split the data stratifying by our target variable, with a proportion of 0.7
+for training and 0.3 for testing.
+
+```{r}
+set.seed(123)
+split <- createDataPartition(data_imp$churn_risk_score, p = 0.7, list = FALSE)
+train <- data_imp[split, ]
+test  <- data_imp[-split, ]
+
+nrow(train)
+nrow(test)
+```
+
+The train set has 25,895 rows, and the test set has 11,097 rows.
+
+### Benchmark model
+
+We train a benchmark model to establish a baseline level of predictive performance,
+allowing us to evaluate whether more complex models provide meaningful improvements.
+The benchmark model always predicts the positive class (churn).
+
+```{r}
+benchmark_model <- glm(churn_risk_score ~ 1,
+                      family = binomial(link ='logit'), 
+                      data = train)
+
+benchmark_probs <- predict(benchmark_model, 
+                                 newdata = test, 
+                                 type = "response")
+
+benchmark_pred <- ifelse(benchmark_probs > 0.5,
+                         levels(train$churn_risk_score)[2],  # positive class
+                         levels(train$churn_risk_score)[1])  # negative class
+
+benchmark_pred <- factor(benchmark_pred,
+                         levels = levels(train$churn_risk_score))
+
+cm_benchmark <- confusionMatrix(benchmark_pred,
+                test$churn_risk_score)
+cm_benchmark
+```
+
+With a benchmark model we get a 54% accuracy, because there's 54% of churners in
+our dataset. We expect to improve our predictions in the following lines.
+
+### Probabilistic Learning
+
+ Since the target variable is binary and most predictors are categorical rather
+ than purely numeric, multinomial logistic regression was selected due to its
+ interpretability and suitability for categorical features.
+ This approach serves as a reference point for evaluating more complex models.
+ Although other alternatives, like Naive Bayes, were briefly considered, they were
+ excluded from final modeling due to unstable performance and strong assumptions
+ that did not align well with the structure of the dataset.
+
+#### Multinomial Logistic Regression
+
+First, we scale the numeric variables. We will use the mean and standard deviation
+of the train set to scale both the train and the test set, to prevent data leakage.
+
+```{r}
+# Identify numeric columns
+num_cols <- sapply(train, is.numeric)
+
+# Compute mean and sd from training set
+means <- sapply(train[, num_cols], mean)
+sds   <- sapply(train[, num_cols], sd)
+
+# Scale training set
+train_scaled <- train
+train_scaled[, num_cols] <- sweep(train[, num_cols], 2, means, "-")
+train_scaled[, num_cols] <- sweep(train_scaled[, num_cols], 2, sds, "/")
+
+# Scale test set using training stats
+test_scaled <- test
+test_scaled[, num_cols] <- sweep(test[, num_cols], 2, means, "-")
+test_scaled[, num_cols] <- sweep(test_scaled[, num_cols], 2, sds, "/")
+
+```
+
+Then, we move on to training the model.
+
+```{r train-class-multinom, cache = TRUE}
+set.seed(123)
+multinom_model <- multinom(churn_risk_score ~ ., data = train_scaled, trace = FALSE)
+```
+
+We use our model to predict churn on the test set.
+
+```{r}
+multinom_pred <- predict(multinom_model, newdata = test_scaled, type = "class")
+
+cm_multinom <- confusionMatrix(multinom_pred, test$churn_risk_score, positive = "Yes")
+cm_multinom
+```
+
+The model performs very well, with high accuracy, strong sensitivity and 
+specificity, and a high precision in identifying churners. It significantly outperforms
+a naive guess and shows balanced performance across classes, making it a reliable
+baseline for comparison with more complex models.
+
+```{r}
+# Predict probabilities for the positive class
+probs_multinom <- predict(multinom_model, newdata = test_scaled, type = "prob")
+roc_obj <- roc(response = test$churn_risk_score, predictor = probs_multinom)
+# AUC value
+auc_multinom <- auc(roc_obj)
+auc_multinom
+# Plot the ROC curve
+plot(roc_obj)
+```
+
+The AUC of the model is fairly high.
+
+Next, we will extract and interpret the statistically significant predictors from 
+the multinomial logistic regression model by filtering for variables with p-values
+below 0.05 and computing their odds ratios for easier interpretation.
+
+```{r}
+tidy(multinom_model) |> 
+  filter(p.value < 0.05) |> 
+  mutate(exp_estimate = exp(estimate)) |> 
+  select(term, estimate, exp_estimate, p.value) |> 
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+The model finds strong, statistically significant relationships between membership
+level, wallet points, complaint history, and joining recency with churn risk. In 
+particular, users with premium memberships or high wallet balances are far less
+likely to churn, while those with past complaints or poor feedback are much more 
+likely to churn.
+
+We might now turn to variable importance:
+
+```{r}
+varImp(multinom_model) %>% 
+  arrange(desc(Overall))
+```
+
+Membership tier is the most important overall predictor of churn behavior (particularly
+Premium and Platinum categories). Customer feedback variables are also critical.
+
+We can further visualize these relationships:
+
+```{r}
+ggpred <- ggpredict(multinom_model, terms = "membership_category")
+plot(ggpred)
+
+ggpred <- ggpredict(multinom_model, terms = "feedback")
+plot(ggpred)
+
+ggpred <- ggpredict(multinom_model, terms = "days_since_joining")
+plot(ggpred)
+
+ggpred <- ggpredict(multinom_model, terms = "past_complaint")
+plot(ggpred)
+```
+
+Basic Membership and No Membership are associated with high churn risk.Platinum and Premium memberships are associated with a very low probability of churn. Negative feedback comments are consistently associated with very high probabilities of churn (as well as "No reason specified"), while positive ones are near zero.
+
+Looking at days_since_joining, users who joined more recently (right side) have a lower churn risk. The longer someone has been with the company, the higher their risk of leaving. Lastly, users with a past complaint have a higher churn risk, although interestingly, both are well above a threshold of 50% (~96% vs. ~90% for those without).
+
+#### Penalized regression
+
+We can train a regularized multinomial logistic regression using the glmnet package
+with cross-validation to select the optimal penalty. Compared to the standard multinomial
+model, the regularized version achieves comparable predictive accuracy while reducing
+model complexity and stabilizing coefficient estimates.
+
+```{r train-class-cv, cache = TRUE}
+set.seed(123)
+# Convert target to numeric class labels
+y <- as.factor(train_scaled$churn_risk_score)
+x <- model.matrix(churn_risk_score ~ . -1, data = train_scaled)  # one-hot encode
+
+# Fit multinomial with cross-validated regularization
+cv_model <- cv.glmnet(x, y, family = "multinomial", type.multinomial = "ungrouped", alpha = 1)
+
+# Best lambda
+cv_model$lambda.min
+
+# Predict on test set
+x_test <- model.matrix(churn_risk_score ~ . -1, data = test_scaled)
+pred_class <- predict(cv_model, newx = x_test, s = "lambda.min", type = "class")
+```
+
+```{r}
+cm_cv <- confusionMatrix(as.factor(pred_class), test$churn_risk_score)
+cm_cv
+```
+
+```{r}
+probs_glmnet <- predict(cv_model, newx = x_test, s = "lambda.min", type = "response")[,,1]
+roc_obj <- roc(response = test$churn_risk_score, predictor = probs_glmnet[, "Yes"])
+auc_cv <- auc(roc_obj)
+auc_cv
+
+plot(roc_obj)
+```
+
+The regularized multinomial logistic regression model slightly outperformed the 
+standard model across most key metrics. It achieved higher accuracy, AUC, and Kappa, indicating better 
+overall performance and agreement. While it showed a minor drop in specificity,
+it gained more in sensitivity and balanced accuracy, suggesting improved ability 
+to correctly identify both classes. The regularized model also benefits from 
+reduced complexity and better generalization by penalizing overfitting.
+
+```{r}
+# Extract coefficients for the "Yes" class
+coefs_glmnet <- coef(cv_model, s = "lambda.min")$Yes
+
+# Convert to data frame and rename
+coef_df <- as.matrix(coefs_glmnet)
+coef_df <- data.frame(term = rownames(coef_df), estimate = coef_df[, 1])
+
+# Tidy, filter, and format
+coef_df %>%
+  filter(term != "(Intercept)", estimate != 0) %>%
+  mutate(
+    exp_estimate = exp(estimate),
+    across(where(is.numeric), ~ round(.x, 3))
+  ) %>%
+  arrange(desc(abs(estimate))) %>% 
+  select(-1)
+```
+
+In the standard multinomial model, we identified important variables based on 
+statistical significance (p < 0.05). In contrast, the regularized model (glmnet)
+performs automatic feature selection by shrinking less important coefficients to
+zero, so we consider non-zero coefficients as meaningful predictors. However,
+we should keep in mind that regularized coefficients are biased towards zero and
+not directly interpretable.
+
+### Machine Learning
+
+For the machine learning section, we will train three models: decision trees, random forests, and gradient boosting. Decision trees provide an interpretable structure to understand feature splits, while random forests and GBM are powerful ensemble methods that improve predictive performance by aggregating multiple trees. These models allow us to capture complex patterns in the data and are particularly effective in handling non-linear relationships and variable interactions.
+
+To ensure efficient model training within reasonable computational limits, the cross-validation setups and tuning parameter grids were adjusted to balance performance and runtime.
+
+#### Decision Trees
+
+First, we train the model on the training set with custom parameters.
+
+```{r train-class-dt, cache = TRUE}
+set.seed(123)
+control <- rpart.control(
+  minsplit = 30,
+  maxdepth = 10,
+  cp = 0.01
+)
+
+model_formula <- churn_risk_score ~.
+
+dt_model <- rpart(model_formula, 
+               data = train,
+               method = "class",
+               control = control)
+
+summary(dt_model)
+```
+
+Next, we can print and plot the complexity parameter table for model pruning.
+The goal is to identify optimal cp that minimizes cross-validated error. We will 
+then prune the tree using the optimal complexity parameter.
+
+```{r}
+printcp(dt_model)  # View cp table
+plotcp(dt_model)   # Plot cross-validated error vs cp
+
+# Prune the tree
+optimal_cp <- dt_model$cptable[which.min(dt_model$cptable[,"xerror"]), "CP"]
+pruned_tree <- prune(dt_model, cp = optimal_cp)
+
+rpart.plot(pruned_tree, digits = 3)
+rpart.plot(dt_model, digits = 3)
+```
+
+3 splits gave the best cross-validated performance. It looks like the original
+model was already using a cp of 0.01, so the two models are identical.
+Notably, only two variables (membership_category and points_in_wallet) were used to construct the tree, 
+indicating they provided the most useful information for predicting churn risk in this model.
+
+```{r}
+dt_model$variable.importance
+```
+
+This confirms that membership_category and points_in_wallet stand out as the most
+influential predictors by a large margin. These variables were responsible for the
+main splits at the top of the tree, meaning they strongly differentiate between churn risk levels.
+feedback and avg_transaction_value have moderate importance. While not as dominant, 
+they still helped improve classification accuracy, possibly in lower branches.
+Variables like avg_frequency_login_days, avg_time_spent, and days_since_joining 
+have low but non-negligible importance, suggesting minor influence in certain paths.
+Finally, days_since_last_login shows very low importance, indicating that it had
+minimal effect on the model's decisions.
+
+Since the original dt_model is already optimized, we proceed with dt_model for 
+generating predictions and evaluating performance.
+
+```{r}
+dt_pred <- predict(dt_model, test, type = "class")
+cm_dt <- confusionMatrix(dt_pred, test$churn_risk_score, positive = "Yes")
+cm_dt
+```
+
+The decision tree model achieves high overall accuracy (93.6%), well above the No
+Information Rate of 54.1%.
+
+Sensitivity is 91.6%, which implies the model correctly identifies most of the 
+positive (high churn risk) cases, which is especially important since it is the
+class that we might care more about identifying in this context.
+
+Specificity is 95.9%, meaning that the model also performs very well in identifying
+negative cases (low churn risk).
+
+Precision is 96.3%, which means that, when the model predicts churn risk, it’s usually right.
+
+Lastly, a Kappa of 0.87 suggests very strong agreement between predicted and actual
+values, beyond what would be expected by chance.
+
+This model is overall very strong.
+
+```{r}
+probs <- predict(dt_model, test, type = "prob")[, "Yes"]
+roc_obj <- roc(test$churn_risk_score, probs)
+plot(roc_obj)
+auc_dt <- auc(roc_obj)
+auc_dt
+```
+
+The AUC also indicates very good discriminatory ability.
+
+#### Random Forest
+
+We train a Random Forest classifier using 10-fold cross-validation and a grid of 
+mtry values to optimize model performance:
+
+```{r train-class-rf, cache = TRUE, cache.lazy = FALSE}
+set.seed(123)
+param_grid <- expand.grid(
+  mtry = c(2, 5, 7)
+)
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  search = "grid",
+  allowParallel = TRUE
+)
+
+rf_model <- train(churn_risk_score ~ ., 
+                  data = train,
+                  method = "rf",
+                  tuneGrid = param_grid,
+                  preProc = c('scale','center'),
+                  tuneLength = 10,
+                  metric = "Accuracy",
+                  trControl = ctrl,
+                  verbose = FALSE)
+```
+
+We can now check and visualize the best mtry value selected.
+
+```{r}
+rf_model$bestTune
+plot(rf_model)
+```
+
+mtry = 7 was selected as the optimal value in the tuning process.
+Now, we use the model to make predictions on the test set.
+
+```{r}
+rf_pred <- predict(rf_model,
+                   newdata = test,
+                   type = "raw")
+
+cm_rf <- confusionMatrix(rf_pred, test$churn_risk_score, positive = "Yes")
+cm_rf
+```
+
+This confusion matrix indicates that the random forest model performs very well 
+on the classification task. The model demonstrates strong predictive performance 
+with minimal bias toward either class.
+
+```{r}
+# Get predicted probabilities for the "Yes" class
+rf_probs <- predict(rf_model, newdata = test, type = "prob")[, "Yes"]
+
+# Compute ROC and AUC
+roc_rf <- roc(response = test$churn_risk_score,
+              predictor = rf_probs,
+              levels = rev(levels(test$churn_risk_score)))
+
+# Plot ROC curve
+plot(roc_rf, main = "ROC Curve - Random Forest")
+
+# Display AUC
+auc_rf <- auc(roc_rf)
+auc_rf
+```
+With an AUC of 0.975, the model is highly capable of distinguishing between the two classes.
+
+Lastly, we check feature importance:
+
+```{r}
+varImp(rf_model)
+```
+
+From the table, we observe that the most important variable influencing the model's
+predictions is, by far, points_in_wallet, followed by the different membership_category
+levels and avg_transaction_value. Other features seem to have considerably lower effects.
+
+#### Gradient Boosting
+
+Lastly, we train a gradient boosting.
+
+```{r train-class-gbm, cache = TRUE}
+set.seed(123)
+
+gb_grid <- expand.grid(
+  n.trees = c(100, 150),
+  interaction.depth = c(1, 3),
+  shrinkage = c(0.05, 0.1),
+  n.minobsinnode = 10
+)
+
+
+gbm_model <- train(
+  churn_risk_score ~ ., 
+  data = train,
+  method = "gbm",
+  trControl = ctrl,
+  tuneGrid = gb_grid,
+  metric = "ROC",
+  preProcess = c("center", "scale"),
+  verbose = FALSE
+)
+```
+
+We use the model to make predictions on the test set, and compute the confusion
+matrix and performance metrics.
+
+```{r}
+gbm_probs <- predict(gbm_model, newdata = test, type = "prob")
+gbm_pred <- ifelse(gbm_probs[, "Yes"] > 0.5, "Yes", "No") |> as.factor()
+
+cm_gbm <- confusionMatrix(gbm_pred, test$churn_risk_score, positive = "Yes")
+cm_gbm
+```
+
+These results indicate that the GBM model demonstrates both strong overall 
+performance and balanced classification ability.
+
+```{r}
+gbm_roc <- roc(response = test$churn_risk_score, 
+               predictor = gbm_probs[, "Yes"])
+
+# Print AUC
+auc_gbm <- auc(gbm_roc)
+auc_gbm
+```
+
+Partial Dependence Plots (PDPs) help visualize the marginal effect of a selected feature on the predicted outcome of our models, by averaging predictions across the range of that variable while holding all other features constant. We will be visualizing these effects of our three most influential variables: points_in_wallet, avg_transaction_value and membership_category.
+
+
+```{r PDP-1, cache = TRUE}
+partial(dt_model, pred.var = "points_in_wallet", plot = TRUE)
+
+partial(rf_model, pred.var = "points_in_wallet", plot = TRUE)
+
+partial(gbm_model, pred.var = "points_in_wallet", plot = TRUE)
+```
+
+All three models identify points_in_wallet as highly influential, especially in the 600–900 range.
+The Decision Tree makes coarse, rule-based predictions, rather than smooth transitions: while Random
+Forest captures smooth, general patterns, showing a noticeable non-linear pattern.
+Gradient Boosting can detect sharper, localized effects, but may also be more sensitive to noise.
+
+We can notice that, for the three plots, we observe meaningful patterns around the 
+500-900 range. Outside this interval, the plots tend to flatten or become erratic. 
+This might be because PDPs are most reliable in regions densely populated with actual data.
+Outside that range, the model is extrapolating, or averaging over regions where there may be few or no data points. 
+We can confirm this by looking at the distribution of the variable.
+
+```{r}
+hist(data_imp$points_in_wallet, breaks = 50)
+```
+
+```{r PDP-2, cache = TRUE}
+partial(dt_model, 
+        pred.var = "avg_transaction_value", 
+        which.class = "Yes", 
+        prob = TRUE, 
+        rug = TRUE,
+        plot = TRUE
+      )
+
+partial(rf_model, 
+        pred.var = "avg_transaction_value", 
+        which.class = "Yes", 
+        prob = TRUE, 
+        rug = TRUE,
+        plot = TRUE
+      )
+
+partial(gbm_model, 
+        pred.var = "avg_transaction_value", 
+        which.class = "Yes", 
+        prob = TRUE, 
+        rug = TRUE,
+        plot = TRUE
+      )
+```
+
+In the first case, the plot is flat because the model didn't use the variable for
+any splits, because it provided no additional predictive value beyond the other 
+features used. For Random Forest, the plot shows a clear downward trend after around 
+45,000, where predicted churn decreases sharply, confirming what we saw earlier: 
+higher transaction values are associated with lower churn risk. Gradient Boosting
+aligns with the Random Forest result, only a bit more abrupt.
+
+```{r PDP-3, cache = TRUE}
+partial(dt_model, pred.var = "membership_category", which.class = "Yes", prob = TRUE, rug = TRUE, plot = TRUE)
+
+partial(rf_model, pred.var = "membership_category", which.class = "Yes", prob = TRUE, rug = TRUE, plot = TRUE)
+
+partial(gbm_model, pred.var = "membership_category", which.class = "Yes", prob = TRUE, rug = TRUE, plot = TRUE)
+```
+
+The PDP shows that the DT model makes coarse splits based on membership_category,
+treating certain categories (Basic Membership and No Membership) as strong churn
+indicators. The random forest shows more nuance, with a clear ordering of membership types:
+No Membership and Basic have the highest churn probabilities, while Gold and Silver
+fall in the middle range, and Premium and Platinum are associated with the lowest predicted risk of churn.
+Lastly, Platinum and Premium  are strongly associated with a lower predicted probability of churn.
+The GBM plot is very similar to the random forest’s, reinforcing the same trend.
+
+#### Model evaluation summary
+
+```{r}
+model_names <- c("Benchmark", "Multinomial", "Regularized (CV)", "Decision Tree", "Random Forest", "Gradient Boosting")
+conf_matrices <- list(cm_benchmark, cm_multinom, cm_cv, cm_dt, cm_rf, cm_gbm)
+auc_values <- c(NA, auc_multinom, auc_cv, auc_dt, auc_rf, auc_gbm)
+
+# Extract metrics
+model_comparison <- tibble(
+  Model = model_names,
+  Accuracy = sapply(conf_matrices, function(cm) cm$overall["Accuracy"]),
+  F1 = sapply(conf_matrices, function(cm) cm$byClass["F1"]),
+  Kappa = sapply(conf_matrices, function(cm) cm$overall["Kappa"]),
+  AUC = auc_values
+) %>%
+  mutate(across(where(is.numeric), round, 5))
+
+# Show table
+model_comparison
+```
+
+These results highlight a clear performance gradient across the models, showcasing the benefits of increasingly complex learning methods:
+
+Benchmark performs poorly (expectedly), with an accuracy of 54.1%, no predictive power (Kappa = 0), and undefined F1 and AUC values due to the lack of positive predictions.
+
+Multinomial logistic regression significantly improves performance, achieving an accuracy of 89.9%, a solid F1-score (0.905), and a Kappa of 0.80, with an AUC of 0.946, indicating strong overall discrimination.
+
+The regularized version (via cross-validation) performs similarly, slightly improving accuracy and Kappa, though with a minor drop in F1.
+
+The decision tree shows an improvement in performance with 93.5% accuracy, an F1-score of 0.939, and strong agreement (Kappa = 0.87), although AUC remains at 0.946.
+
+Random forest boosts performance with an AUC of 0.975, the highest so far, reflecting superior ability to rank predictions. Accuracy, F1, and Kappa are also high (all > 0.93), highlighting robust and balanced predictive performance.
+
+Lastly, Gradient boosting delivers the best overall performance: 94.1% accuracy, an F1-score of 0.945, Kappa of 0.88, and AUC = 0.975, slightly improving the random forest, especially in terms of consistency and fine-grained optimization.
+
+## Regression
+
+In this section, Statistical and Machine Learning tools will be applied to predict
+users' avg_transaction_value based on our feature set.
+
+### Exploring the target: average transaction value
+
+From the previous correlation plot, we know that avg_transaction_value is moderately
+correlated with two other numerical predictors: avg_frequency_login_days and 
+points_in_wallet.
+
+```{r}
+# Scatter plot: avg_transaction_value vs avg_frequency_login_days
+ggplot(data_imp, aes(x = avg_frequency_login_days, y = avg_transaction_value)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "loess", se = TRUE, color = "darkred") +
+  labs(
+    title = "Transaction Value vs. Login Frequency",
+    x = "Average Frequency of Login Days",
+    y = "Average Transaction Value"
+  ) +
+  theme_minimal()
+
+# Scatter plot: avg_transaction_value vs points_in_wallet
+ggplot(data_imp, aes(x = points_in_wallet, y = avg_transaction_value)) +
+  geom_point(alpha = 0.5, color = "darkgreen") +
+  geom_smooth(method = "loess", se = TRUE, color = "darkred") +
+  labs(
+    title = "Transaction Value vs. Points in Wallet",
+    x = "Points in Wallet",
+    y = "Average Transaction Value"
+  ) +
+  theme_minimal()
+```
+
+These scatter plots appear visually unusual due to the presence of strong vertical banding, which suggests that many observations share identical or rounded values for the predictors (exact integers or capped values). This pattern often reflects data preprocessing artifacts, discretization, or operational thresholds, which can lead to clustering and reduce the apparent variability in the data. We hope that the machine learning models selected are sufficiently robust to such patterns.
+
+```{r}
+cat_vars <- c("gender", "region_category", "membership_category", "joined_through_referral",
+              "preferred_offer_types", "medium_of_operation", "internet_option",
+              "used_special_discount", "offer_application_preference", "past_complaint",
+              "complaint_status", "feedback",
+              "joining_weekday", "last_visit_period")
+
+# Loop to create boxplots for each variable
+for (var in cat_vars) {
+  p <- ggplot(data_imp, aes_string(x = var, y = "avg_transaction_value")) +
+    geom_boxplot(fill = "lightblue") +
+    labs(
+      title = paste("Average Transaction Value by", var),
+      x = var,
+      y = "Average Transaction Value"
+    ) +
+    theme_minimal()
+  
+  print(p)
+}
+```
+
+With the exception of feedback and membership_category, we can observe that the numerical
+outcome is quite evenly distributed across the levels of all our categorical predictors.
+
+Next, we can check skewness of our variables to see if any transformations are needed.
+
+```{r}
+# Compute skewness for each numeric variable
+skew_df <- sapply(numeric_vars, skewness, na.rm = TRUE) %>%
+  sort(decreasing = TRUE)
+
+# Show results
+skew_df
+# Create a data frame and flag variables needing transformation
+skew_tbl <- data.frame(
+  Variable = names(skew_df),
+  Skewness = skew_df,
+  Needs_Transformation = abs(skew_df) > 1  # Rule of thumb
+)
+
+print(skew_tbl)
+```
+
+We will apply a log transformation to the variables avg_time_spent and avg_transaction_value to reduce their right-skewness and improve the linearity assumptions required by some regression models. Specifically, we use the log1p() function, which computes log(1 + x), allowing us to safely transform values even when zeros are present.
+This is also intended to deal with the notable volume of outliers in the upper end of the variables.
+
+```{r}
+data_imp <- data_imp %>%
+  mutate(
+    log_avg_time_spent = log1p(avg_time_spent),
+    log_avg_transaction_value = log1p(avg_transaction_value)
+  )
+```
+
+
+### Data split
+
+As earlier, we stratify by the outcome variable to sample train and test sets, using
+a proportion of 0.7 for training.
+
+```{r}
+set.seed(123)
+split <- createDataPartition(data_imp$log_avg_transaction_value, p = 0.7, list = FALSE)
+train <- data_imp[split, ]
+test  <- data_imp[-split, ]
+
+nrow(train)
+nrow(test)
+
+# exclude the original versions of the transformed variables from the train set
+# to avoid leakage and multicollinearity
+
+train_model <- train %>%
+  select(-avg_transaction_value, -avg_time_spent)
+```
+
+We end up with a training set of 25,896 rows and a testing set of 11,096.
+
+### Benchmark model
+
+As a baseline, we train a benchmark model that simply predicts the mean of the target variable from the training set for all test observations. This provides a reference point to evaluate whether more complex models offer meaningful improvements in predictive accuracy.
+
+```{r}
+# Compute mean on the log-transformed target
+mean_target <- mean(train_model$log_avg_transaction_value)
+
+# Predict that value for all test rows
+benchmark_preds <- rep(mean_target, nrow(test))
+
+# Back-transform predictions and actuals to the original scale
+preds_original <- expm1(benchmark_preds)
+actual_original <- expm1(test$log_avg_transaction_value)
+
+# Compute error on the original scale
+rmse_benchmark <- rmse(actual_original, preds_original)
+mae_benchmark <- mae(actual_original, preds_original)
+rmse_benchmark
+mae_benchmark
+
+# Compute R-squared
+r_squared_benchmark <- 1 - sum((actual_original - benchmark_preds)^2) / 
+                      sum((actual_original - mean(actual_original))^2)
+
+r_squared_benchmark
+```
+
+The error metrics serve as a baseline to assess the added value of more sophisticated models.
+An R-squared of -2.24 implies that the benchmark model explains less than none of the variance in the test data. In fact, it's more than twice as bad as just predicting the mean of the test set.
+
+Note that we do not use postResample() or rely on the R-squared values reported in model summaries because all models were trained on a log-transformed target variable. These built-in metrics reflect performance on the transformed scale, which is not directly interpretable. Instead, we evaluate RMSE, MAE, and R-squared on the back-transformed (original) scale for all models to ensure meaningful comparisons.
+
+### Statistical Learning
+
+#### Linear Regression
+
+```{r train-regress-lm, cache = TRUE}
+# Fit the model on the training set
+lm_model <- lm(log_avg_transaction_value ~ ., data = train_model)
+
+# Summarize the model
+summary(lm_model)
+```
+We can see that some coefficients appear as NA in the model output because of perfect multicollinearity. Specifically, the category "Not Applicable" of complaint_status is entirely determined by another variable (past_complaint), so the model automatically excludes them to avoid redundancy.
+
+Overall, the linear regression model for log_avg_transaction_value shows a low explanatory power (R-squared around 0.08), with only a few statistically significant predictors (primarily in the feedback categories) while most other variables contribute little, suggesting limited predictive strength and potential multicollinearity. This also indicates plenty of room for improvement through regularization or more flexible models that can better capture nonlinearities and interactions.
+
+Moving on to predictions:
+
+```{r}
+# Predict on the test set (log scale)
+lm_preds_log <- predict(lm_model, newdata = test)
+
+# Back-transform predictions and actuals to the original scale
+lm_preds_original <- expm1(lm_preds_log)
+actual_original <- expm1(test$log_avg_transaction_value)
+
+# Compute error metrics on the original scale
+rmse_lm <- rmse(actual_original, lm_preds_original)
+mae_lm <- mae(actual_original, lm_preds_original)
+rmse_lm
+mae_lm
+
+# Compute R-squared manually
+rss <- sum((actual_original - lm_preds_original)^2)
+tss <- sum((actual_original - mean(actual_original))^2)
+r_squared_lm <- 1 - rss / tss
+
+r_squared_lm
+```
+
+As expected, the error metrics improve over the benchmark model, as well as the R-squared.
+
+#### Elastic Net
+
+First, we prepare the data to train this second model. Since our focus is not on coefficient interpretation, but on predictive performance, we didn't scale our numerical predictors earlier. However, doing so is important for Elastic Net, because L1 and L2 regularization are scale-sensitive. Without scaling, variables with larger numeric ranges could dominate the penalty terms and bias the model.
+
+```{r}
+# Prepare training data
+# We'll remove variables that caused multicollinearity, like original untransformed vars
+train_model <- train %>%
+  select(-avg_transaction_value, -avg_time_spent, -complaint_status)  # drop redundant vars
+
+# Create x (matrix) and y (vector) for glmnet
+x <- model.matrix(log_avg_transaction_value ~ ., data = train_model)[, -1]  # drop intercept
+y <- train_model$log_avg_transaction_value
+```
+
+Then, we move on to tuning and training the model:
+
+```{r train-regress-elastic, cache = TRUE}
+set.seed(123)
+
+# Define tuning grid: alpha = 0 (Ridge) to 1 (Lasso)
+elastic_grid <- expand.grid(
+  alpha = seq(0, 1, length = 10),
+  lambda = 10^seq(-3, 1, length = 100)
+)
+
+ctrl <- trainControl(method = "cv", number = 5)
+
+elastic_model <- train(
+  x = x,
+  y = y,
+  method = "glmnet",
+  preProcess = c("center", "scale"),
+  tuneGrid = elastic_grid,
+  trControl = ctrl,
+  metric = "RMSE"
+)
+```
+
+
+The Elastic Net model was trained using 5-fold cross-validation. The optimal combination of alpha and lambda was selected based on minimizing RMSE. The R-squared values across all configurations remain very modest, indicating that the model explains only a small proportion of the variance in log_avg_transaction_value. This suggests that although regularization helped with stability, it didn't improve predictive power that much.
+
+We may now extract the features that were selected by Elastic Net:
+
+```{r}
+# Extract the final model from caret
+final_model <- elastic_model$finalModel
+
+# Get the lambda used for final model
+final_lambda <- elastic_model$bestTune$lambda
+
+# Extract coefficients at that lambda
+coef_matrix <- coef(final_model, s = final_lambda)
+
+# Convert to a data frame for easier inspection
+selected_features <- as.data.frame(as.matrix(coef_matrix))
+selected_features$feature <- rownames(selected_features)
+colnames(selected_features)[1] <- "coefficient"
+
+# Keep only non-zero coefficients (excluding intercept if you want)
+nonzero_features <- selected_features[selected_features$coefficient != 0, ]
+
+# Optional: remove the intercept
+nonzero_features <- nonzero_features[nonzero_features$feature != "(Intercept)", ]
+
+# View selected variables
+nonzero_features %>% select(-feature)
+```
+
+While most coefficients in the model are small (as expected due to regularization and the log-transformed outcome), positive feedback categories (User Friendly Website, Products always in Stock, and Quality Customer Care) show stronger, positive associations with transaction value, suggesting they are key drivers of customer engagement.
+
+After training, we shall use the model to make predictions:
+
+```{r}
+# Prepare test matrix (same vars and encoding as x)
+x_test <- model.matrix(log_avg_transaction_value ~ ., data = test)[, -1]
+
+# Predict
+elastic_preds_log <- predict(elastic_model, newdata = x_test)
+
+# Back-transform
+elastic_preds_original <- expm1(elastic_preds_log)
+actual_original <- expm1(test$log_avg_transaction_value)
+
+# Metrics
+rmse_elastic <- rmse(actual_original, elastic_preds_original)
+mae_elastic <- mae(actual_original, elastic_preds_original)
+rmse_elastic
+mae_elastic
+
+# Compute R-squared manually
+rss <- sum((actual_original - elastic_preds_original)^2)
+tss <- sum((actual_original - mean(actual_original))^2)
+r_squared_elastic <- 1 - rss / tss
+
+r_squared_elastic
+```
+
+Error metrics seem to indicate modest improvement over the benchmark, but they are slightly
+worse than the linear model. R-squared is also worse. Let's see if we can further enhance prediction.
+
+#### Stepwise feature selection
+
+```{r train-regress-stepwise, cache = TRUE}
+# We have to retrain the lm with the new train set (excluding complaint status)
+lm_model <- lm(log_avg_transaction_value ~ ., data = train_model)
+
+stepwise_model <- stepAIC(lm_model, direction = "both", trace = FALSE)
+summary(stepwise_model)
+```
+
+This stepwise model selected a parsimonious subset of predictors: medium_of_operation, feedback, churn_risk_score, and joining_weekday. While statistically significant overall (p-value < 2.2e-16), the adjusted R squared is only ~0.078, indicating that the model explains about 7.8% of the variance in the log of avg_transaction_value.
+The model aligns with our Elastic Net results in the selected features, highlighting the influence of positive feedback, though the effect sizes are likewise small.
+
+```{r}
+# Predict on test set (log scale)
+stepwise_preds_log <- predict(stepwise_model, newdata = test)
+
+# Back-transform
+stepwise_preds_original <- expm1(stepwise_preds_log)
+actual_original <- expm1(test$log_avg_transaction_value)
+
+# Metrics
+rmse_stepwise <- rmse(actual_original, stepwise_preds_original)
+mae_stepwise <- mae(actual_original, stepwise_preds_original)
+rmse_stepwise
+mae_stepwise
+
+# Compute R-squared manually
+rss <- sum((actual_original - stepwise_preds_original)^2)
+tss <- sum((actual_original - mean(actual_original))^2)
+r_squared_stepwise <- 1 - rss / tss
+
+r_squared_stepwise
+```
+
+The error metrics and the R-squared are slighly better than any of the previous models.
+This is an improvement, specially considering that this model is more interpretable and avoids overfitting
+by selecting the most relevant features. However, there is still substantial room for improvement. This motivates the use of more flexible machine learning models, which we now turn to in hopes of capturing more complex patterns in the data.
+
+### Machine Learning
+
+In this section, we will use a series of machine learning techniques, which are better suited 
+to handle complex relationships and interactions. These methods might offer improvements in our prediction accuracy.
+
+#### Decision Trees
+
+First, we set up training control, and define grid of tuning parameters over a range of cp values:
+
+```{r}
+set.seed(123)
+
+control <- trainControl(
+  method = "cv",
+  number = 5,          # 5-fold CV
+  verboseIter = TRUE
+)
+
+dt_grid <- expand.grid(cp = seq(0.0001, 0.05, length.out = 20))
+```
+
+Next, we prepare the data. Since decision trees don't require log transformations or scaling for skewed predictors, we don't need the log version of avg_time_spent. However, we are using the log-transformed target for training because it can yield better performance, so we remove the original untransformed target to avoid confusion or leakage.
+
+```{r}
+train_model <- train %>%
+  select(-avg_transaction_value, -log_avg_time_spent)
+```
+
+We can now train the model and inspect the results:
+
+```{r train-regress-dt, cache = TRUE}
+tree_tuned <- train(
+  log_avg_transaction_value ~ ., 
+  data = train_model,
+  method = "rpart",
+  trControl = control,
+  tuneGrid = dt_grid,
+  metric = "RMSE"
+)
+
+print(tree_tuned)
+plot(tree_tuned)
+```
+
+During the pruning process of the decision tree, some values of the resampled performance metrics (particularly R-squared) were reported as NaN. This typically occurs when predictions for certain resampling folds are constant, leading to a zero variance in either predictions or actual values, which makes R-squared undefined. This is not
+so much of a concern, since our selected model is in the range with valid metrics.
+
+Moreover, Decision Trees are also quite transparent and interpretable tools, so we can inspect the
+rules and decisions that explain each prediction:
+
+```{r}
+rpart.plot(tree_tuned$finalModel, type = 2, extra = 101)
+```
+
+The decision tree reveals that the most influential predictor of average transaction value is the customer's churn risk score, with churn-risk customers showing slightly lower predicted spending overall. Among customers not flagged as churn risks, the model highlights the importance of positive feedback. This suggests that satisfaction across several key points may translate into more valuable customer behavior.
+
+Now, let's use the model to make predictions on the test set:
+
+```{r}
+# Predict on the test set (log scale)
+dt_preds_log <- predict(tree_tuned, newdata = test)
+
+# Back-transform predictions and actuals to the original scale
+dt_preds_original <- expm1(dt_preds_log)
+actual_original <- expm1(test$log_avg_transaction_value)
+
+# Compute error metrics
+rmse_dt <- RMSE(dt_preds_original, actual_original)
+mae_dt <- MAE(dt_preds_original, actual_original)
+rmse_dt
+mae_dt
+
+# Compute R-squared
+rss <- sum((actual_original - dt_preds_original)^2)
+tss <- sum((actual_original - mean(actual_original))^2)
+r_squared_dt <- 1 - rss / tss
+
+r_squared_dt
+```
+
+These metrics only slightly improve our previous attempts.
+
+#### Random Forest
+
+Given the limitations of individual decision trees in capturing complex patterns and their tendency to overfit or underfit depending on pruning, we now turn to Random Forests, an ensemble method that aggregates many trees to improve predictive accuracy and reduce variance, and from which we expect stronger performance.
+
+Similarly to the previous model, we first set up tuning grid and use the same 5-fold CV control function as earlier:
+
+```{r}
+# Tune over different numbers of randomly selected variables at each split
+rf_grid <- expand.grid(mtry = floor(seq(2, sqrt(ncol(train_model) - 1) * 2, length.out = 3)))
+```
+
+And we train the RF model with the previous feature set:
+
+```{r train-regress-rf, cache = TRUE, cache.lazy = FALSE}
+set.seed(123)
+
+rf_model <- train(
+  log_avg_transaction_value ~ ., 
+  data = train_model,
+  method = "rf",
+  trControl = control,
+  tuneGrid = rf_grid,
+  ntree = 200,
+  importance = TRUE
+)
+```
+
+```{r}
+# Predict on the test set (log scale)
+rf_preds_log <- predict(rf_model, newdata = test)
+
+# Back-transform to original scale
+rf_preds_original <- expm1(rf_preds_log)
+actual_original <- expm1(test$log_avg_transaction_value)
+
+# Compute RMSE and MAE
+rmse_rf <- rmse(actual_original, rf_preds_original)
+mae_rf <- mae(actual_original, rf_preds_original)
+
+# Print results
+rmse_rf
+mae_rf
+
+# Compute R-squared manually
+rss <- sum((actual_original - rf_preds_original)^2)
+tss <- sum((actual_original - mean(actual_original))^2)
+r_squared_rf <- 1 - rss / tss
+
+r_squared_rf
+```
+
+Surprisingly, Random Forest has very bad results, worse than the more simple Decision Trees.
+
+```{r}
+varImp(rf_model)
+```
+
+RF is consistent with other models in the features that influence predictions, with
+positive feedback categories and churn risk being the most important. Other variables
+(avg_frequency_login_days, "Poor Product Quality" level of feedback, joining_month or
+days_since_joining) have a moderate influence.
+
+#### Gradient Boosting
+
+This method also builds on decision trees. We will create a custom grid and use the previous 5-fold CV training control:
+
+```{r}
+gbm_grid <- expand.grid(
+  n.trees = c(100, 200),      
+  interaction.depth = c(1, 3),      
+  shrinkage = c(0.1),       
+  n.minobsinnode = c(10)  
+)
+```
+
+We now move on to training the model:
+
+```{r train-regress-gbm, cache = TRUE}
+set.seed(123)
+
+# Train the Gradient Boosting model
+gbm_model <- train(
+  log_avg_transaction_value ~ .,
+  data = train_model,
+  method = "gbm",
+  trControl = control,
+  verbose = FALSE,
+  tuneGrid = gbm_grid
+)
+
+summary(gbm_model)
+```
+```{r}
+# Predict on the test set (log scale)
+gbm_preds_log <- predict(gbm_model, newdata = test)
+
+# Back-transform to original scale
+gbm_preds_original <- expm1(gbm_preds_log)
+actual_original <- expm1(test$log_avg_transaction_value)
+
+# Compute RMSE and MAE
+rmse_gbm <- rmse(actual_original, gbm_preds_original)
+mae_gbm <- mae(actual_original, gbm_preds_original)
+
+# Print results
+rmse_gbm
+mae_gbm
+
+# Compute R-squared manually
+rss <- sum((actual_original - gbm_preds_original)^2)
+tss <- sum((actual_original - mean(actual_original))^2)
+r_squared_gbm <- 1 - rss / tss
+
+r_squared_gbm
+```
+
+The error metrics are also higher than other trained models, and the R-squared 
+is lower, so Gradient Boosting doesn't seem to be a good choice for our prediction task.
+
+```{r}
+varImp(gbm_model)
+```
+
+For GBM, the most influential features are also positive feedback categories, but unlike
+RF, the rest of the variables in the dataset have considerably lower importance.
+
+#### Neural Networks
+
+Lastly, we will train neural networks. NNs are well-suited for modeling nonlinear relationships, though they require careful tuning and are often less interpretable.
+
+```{r train-regress-nn, cache = TRUE}
+set.seed(123)
+
+# Define tuning grid for neural net
+nn_grid <- expand.grid(
+  size = c(1, 3, 5),  
+  decay = c(0, 0.01, 0.1)  
+)
+
+# Train the model 
+nn_model <- train(
+  log_avg_transaction_value ~ .,
+  data = train_model,
+  method = "nnet",
+  preProcess = c("center", "scale"),
+  tuneGrid = nn_grid,
+  linout = TRUE,            
+  trace = FALSE,           
+  maxit = 500,              
+  trControl = control
+)
+```
+
+We make predictions one more time:
+
+```{r}
+# Predict on the test set (log scale)
+nn_preds_log <- predict(nn_model, newdata = test)
+
+# Back-transform to original scale
+nn_preds_original <- expm1(nn_preds_log)
+actual_original <- expm1(test$log_avg_transaction_value)
+
+# Compute RMSE and MAE
+rmse_nn <- rmse(actual_original, nn_preds_original)
+mae_nn <- mae(actual_original, nn_preds_original)
+
+# Print results
+rmse_nn
+mae_nn
+
+# Compute R-squared manually
+rss <- sum((actual_original - nn_preds_original)^2)
+tss <- sum((actual_original - mean(actual_original))^2)
+r_squared_nn <- 1 - rss / tss
+
+r_squared_nn
+```
+
+These metrics are better than GBM and RF, but still worse than Decision Trees or even
+statistical learning methods. 
+
+Let's check variable importance:
+
+```{r}
+varImp(nn_model)
+```
+
+NN aligns with RF and GBM on the top features, highlighting positive feedback as most important. However, it gives surprisingly high importance to joining weekday and medium of operation. While this might initially suggest overfitting, the fact that these same variables showed small but consistent effects in the linear, elastic net, and stepwise models supports the idea that they have some real but subtle predictive signals. The NN may be able to capture nonlinear interactions or effects that statistical models detect only weakly.
+
+#### Model evaluation summary
+
+```{r}
+# Create summary data frame from precomputed values
+results <- data.frame(
+  Model = c("Linear Regression", "Elastic Net", "Stepwise Regression",
+            "Decision Tree", "Random Forest", "Gradient Boostin", "Neural Network"),
+  
+  MAE = c(mae_lm, mae_elastic, mae_stepwise, mae_dt, mae_rf, mae_gbm, mae_nn),
+  
+  RMSE = c(rmse_lm, rmse_elastic, rmse_stepwise, rmse_dt, rmse_rf, rmse_gbm, rmse_nn),
+  
+  R_squared = c(r_squared_lm, r_squared_elastic, r_squared_stepwise,
+                r_squared_dt, r_squared_rf, r_squared_gbm, r_squared_nn)
+)
+
+# Round for presentation
+results$MAE <- round(results$MAE, 3)
+results$RMSE <- round(results$RMSE, 3)
+results$R_squared <- round(results$R_squared, 4)
+
+# Print results
+print(results)
+```
+
+The first thing we notice is that all models perform very similarly: MAE stays in the 15,000–15,350 range,
+and RMSE ranges 18,600–19,300. This implies that all models are struggling to explain much variation in avg_transaction_value. R-squared around 0.08–0.10 means each model explains only 8–10% of the variance in the target. Random Forest, surprisingly, is the worst here, with just 3%. Within this narrow margin, Stepwise Regression and Decision Trees happen to be the best models.
+
+It's worth noting that nonlinear models aren’t outperforming linear ones, maybe because most predictors are weakly correlated with the target, or maybe because the target is noisier than we expected.
+
+Given that all individual models performed similarly and explained very little variance, I chose not to train an ensemble. In this context, combining weak models would not offer meaningful gains in predictive performance.
+
+Let's inspect actual vs. predicted values for the best couple of models:
+
+```{r}
+ggplot(data = NULL, aes(x = actual_original, y = stepwise_preds_original)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "darkred") +
+  labs(
+    title = "Stepwise Regression: Predicted vs. Actual",
+    x = "Actual avg_transaction_value",
+    y = "Predicted avg_transaction_value"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(data = NULL, aes(x = actual_original, y = dt_preds_original)) +
+  geom_point(alpha = 0.4, color = "forestgreen") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "darkred") +
+  labs(
+    title = "Decision Tree: Predicted vs. Actual",
+    x = "Actual avg_transaction_value",
+    y = "Predicted avg_transaction_value"
+  ) +
+  theme_minimal()
+
+# Check again our target variable distribution:
+hist(actual_original, breaks = 50, main = "Distribution of avg_transaction_value",
+     xlab = "avg_transaction_value")
+```
+
+The shape of the target variable itself might be another reason for our models' failure. The distribution of avg_transaction_value is dense and fairly uniform up to 50,000, then drops off sharply with a long tail reaching 100,000. This suggests there may be different customer types or behaviors in the data that aren't clearly captured by the available features. As a result, the models tend to predict around a few central values—especially 20,000 and 40,000, regardless of the actual value.
+
+This is visible in the predicted vs. actual plots, where most predictions are flat and don’t follow the ideal diagonal line. The low R-squared values reflect this: the models can’t explain much of the variation because the patterns in the data are either weak or too noisy. So while all models show similar performance metrics, they may be limited more by the data than by the modeling approach.
+
+## Final considerations
+
+Overall, our classification task achieved very strong performance, suggesting that the features in the dataset are well-suited for predicting churn. This aligns with the origin of the dataset, which appears to be either synthetically generated or specifically designed for churn prediction. The variables are clearly structured to support that goal.
+
+In contrast, our regression task proved much more challenging. We selected avg_transaction_value as a target because it seemed meaningful and showed correlations with other features. However, despite trying multiple modeling approaches, both linear and nonlinear, all models struggled to explain much variance in the outcome. This suggests that the variable may not be predictable with the available features.
